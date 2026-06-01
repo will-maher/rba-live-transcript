@@ -389,6 +389,42 @@ HTML = """<!DOCTYPE html>
     .detail-actions { display: flex; gap: 8px; padding-bottom: calc(32px + var(--sb)); }
     .btn-del { color: var(--red) !important; border-color: currentColor !important; }
 
+    /* ─── DURATION PICKER ───────────────────────── */
+    .duration-row {
+      display: flex;
+      gap: 6px;
+    }
+    .dur {
+      flex: 1;
+      padding: 9px 4px;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      background: var(--surface);
+      color: var(--muted);
+      cursor: pointer;
+      transition: all 0.12s;
+      text-align: center;
+    }
+    .dur.selected {
+      background: var(--text);
+      border-color: var(--text);
+      color: #FFF;
+    }
+    .dur:active { opacity: 0.7; }
+
+    .countdown {
+      font-size: 12px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      margin-left: auto;
+      flex-shrink: 0;
+    }
+    .countdown.warn { color: var(--red); }
+
     /* ─── TOAST ──────────────────────────────────── */
     #toast {
       position: fixed;
@@ -441,6 +477,17 @@ HTML = """<!DOCTYPE html>
         <input type="url" id="streamUrl" placeholder="Paste YouTube or stream URL" autocomplete="off" autocorrect="off" autocapitalize="off">
       </div>
 
+      <div>
+        <div class="label">Duration</div>
+        <div class="duration-row">
+          <div class="dur selected" data-mins="30"  onclick="setDur(this)">30 m</div>
+          <div class="dur"          data-mins="60"  onclick="setDur(this)">1 hr</div>
+          <div class="dur"          data-mins="90"  onclick="setDur(this)">90 m</div>
+          <div class="dur"          data-mins="120" onclick="setDur(this)">2 hr</div>
+          <div class="dur"          data-mins="0"   onclick="setDur(this)">∞</div>
+        </div>
+      </div>
+
       <div class="controls">
         <button class="btn dark" id="startBtn" onclick="startSession()">Start</button>
         <button class="btn stop"  id="stopBtn"  onclick="stopSession()"  style="display:none">Stop</button>
@@ -450,6 +497,7 @@ HTML = """<!DOCTYPE html>
       <div class="status">
         <div class="dot" id="dot"></div>
         <div class="status-msg" id="statusMsg">Ready</div>
+        <div class="countdown" id="countdown"></div>
       </div>
 
       <div class="transcript-box" id="transcriptBox">
@@ -484,6 +532,44 @@ HTML = """<!DOCTYPE html>
 const TOKEN_KEY   = 'vb_token';
 const HISTORY_KEY = 'vb_history';
 let es = null, buffer = '', activeId = null, toastTimer;
+let durMins = 30, timerInterval = null, timerEnd = null;
+
+/* ── Duration picker ───────────────────────────── */
+function setDur(el) {
+  document.querySelectorAll('.dur').forEach(d => d.classList.remove('selected'));
+  el.classList.add('selected');
+  durMins = parseInt(el.dataset.mins, 10);
+}
+
+function startTimer() {
+  clearInterval(timerInterval);
+  const cdEl = document.getElementById('countdown');
+  if (!durMins) { cdEl.textContent = ''; return; }
+  timerEnd = Date.now() + durMins * 60 * 1000;
+  function tick() {
+    const remaining = timerEnd - Date.now();
+    if (remaining <= 0) {
+      cdEl.textContent = '0:00';
+      endSession();
+      return;
+    }
+    const m = Math.floor(remaining / 60000);
+    const s = Math.floor((remaining % 60000) / 1000).toString().padStart(2, '0');
+    cdEl.textContent = m + ':' + s;
+    cdEl.classList.toggle('warn', remaining < 60000);
+  }
+  tick();
+  timerInterval = setInterval(tick, 1000);
+}
+
+function stopTimer() {
+  clearInterval(timerInterval);
+  timerInterval = null;
+  timerEnd = null;
+  const cdEl = document.getElementById('countdown');
+  cdEl.textContent = '';
+  cdEl.classList.remove('warn');
+}
 
 /* ── Auth ──────────────────────────────────────── */
 async function doLogin() {
@@ -556,7 +642,7 @@ function startSession() {
 
   es.onmessage = ({ data }) => {
     const d = JSON.parse(data);
-    if      (d.type === 'status')     setStatus(d.text, d.live || false);
+    if      (d.type === 'status')     { setStatus(d.text, d.live || false); if (d.live) startTimer(); }
     else if (d.type === 'transcript') { buffer += d.text + ' '; renderBuffer(); }
     else if (d.type === 'error')      { setStatus('Error: ' + d.text, false); endSession(); }
     else if (d.type === 'done')       { setStatus('Complete', false); endSession(); }
@@ -568,6 +654,7 @@ function stopSession() { endSession(); }
 
 function endSession() {
   if (es) { es.close(); es = null; }
+  stopTimer();
   document.getElementById('startBtn').style.display = 'block';
   document.getElementById('stopBtn').style.display  = 'none';
   document.getElementById('dot').classList.remove('on');
