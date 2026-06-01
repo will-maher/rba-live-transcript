@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import secrets
+import tempfile
 
 import yt_dlp
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
@@ -12,6 +13,15 @@ from sse_starlette.sse import EventSourceResponse
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "verbatim")
+
+# Write YouTube cookies to a temp file once at startup if provided
+_COOKIES_FILE: str | None = None
+_yt_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+if _yt_cookies:
+    _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+    _tmp.write(_yt_cookies)
+    _tmp.close()
+    _COOKIES_FILE = _tmp.name
 
 app = FastAPI()
 valid_tokens: set[str] = set()
@@ -797,6 +807,8 @@ async def transcribe(url: str, request: Request, token: str = ""):
 
             def get_audio_url():
                 opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
+                if _COOKIES_FILE:
+                    opts["cookiefile"] = _COOKIES_FILE
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     if "entries" in info:
