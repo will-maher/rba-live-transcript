@@ -17,10 +17,12 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "verbatim")
 # Deterministic token derived from password — survives redeploys
 VALID_TOKEN = hashlib.sha256(f"verbatim:{APP_PASSWORD}".encode()).hexdigest()
 
-# Write YouTube cookies to a temp file once at startup if provided
+# Write YouTube cookies to a temp file once at startup if provided.
+# Railway can escape newlines as \n literals — normalise both forms.
 _COOKIES_FILE: str | None = None
 _yt_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
 if _yt_cookies:
+    _yt_cookies = _yt_cookies.replace("\\n", "\n")  # fix Railway escaping
     _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
     _tmp.write(_yt_cookies)
     _tmp.close()
@@ -90,6 +92,24 @@ self.addEventListener('fetch', e => {
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/debug")
+async def debug(token: str = ""):
+    if token != VALID_TOKEN:
+        raise HTTPException(status_code=401)
+    cookie_lines = 0
+    if _COOKIES_FILE:
+        try:
+            with open(_COOKIES_FILE) as f:
+                cookie_lines = sum(1 for l in f if l.strip() and not l.startswith("#"))
+        except Exception:
+            pass
+    return {
+        "cookies_file": _COOKIES_FILE,
+        "cookie_lines": cookie_lines,
+        "deepgram_key_set": bool(DEEPGRAM_API_KEY),
+    }
 
 
 HTML = """<!DOCTYPE html>
@@ -797,14 +817,34 @@ async def transcribe(url: str, request: Request, token: str = ""):
             loop = asyncio.get_event_loop()
 
             def get_audio_url():
-                opts = {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
+                # Try progressively: cookies → ios client → android client
+                attempts = [
+                    {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
+                    {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+                    {"extractor_args": {"youtube": {"player_client": ["web_creator"]}}},
+                    {},  # bare fallback
+                ]
+                base = {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
                 if _COOKIES_FILE:
-                    opts["cookiefile"] = _COOKIES_FILE
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if "entries" in info:
-                        info = info["entries"][0]
-                    return info.get("url") or info.get("manifest_url")
+                    base["cookiefile"] = _COOKIES_FILE
+
+                last_err = None
+                for extra in attempts:
+                    opts = {**base, **extra}
+                    try:
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            info = ydl.extract_info(url, download=False)
+                            if "entries" in info:
+                                info = info["entries"][0]
+                            audio = info.get("url") or info.get("manifest_url")
+                            if audio:
+                                return audio
+                    except Exception as e:
+                        last_err = e
+                        continue
+                if last_err:
+                    raise last_err
+                return None
 
             audio_url = await loop.run_in_executor(None, get_audio_url)
 
