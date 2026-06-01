@@ -1,32 +1,17 @@
-import asyncio
 import hashlib
 import json
 import os
-import tempfile
 
-import yt_dlp
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
-from sse_starlette.sse import EventSourceResponse
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "verbatim")
 
 # Deterministic token derived from password — survives redeploys
 VALID_TOKEN = hashlib.sha256(f"verbatim:{APP_PASSWORD}".encode()).hexdigest()
-
-# Write YouTube cookies to a temp file once at startup if provided.
-# Railway can escape newlines as \n literals — normalise both forms.
-_COOKIES_FILE: str | None = None
-_yt_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
-if _yt_cookies:
-    _yt_cookies = _yt_cookies.replace("\\n", "\n")  # fix Railway escaping
-    _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-    _tmp.write(_yt_cookies)
-    _tmp.close()
-    _COOKIES_FILE = _tmp.name
 
 app = FastAPI()
 
@@ -70,7 +55,7 @@ async def icon():
 
 @app.get("/sw.js")
 async def service_worker():
-    sw = """const CACHE = 'verbatim-v2';
+    sw = """const CACHE = 'verbatim-v3';
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.add('/')));
   self.skipWaiting();
@@ -82,8 +67,7 @@ self.addEventListener('activate', e => {
   self.clients.claim();
 });
 self.addEventListener('fetch', e => {
-  if (e.request.url.includes('/transcribe') ||
-      e.request.url.includes('/login')) return;
+  if (e.request.url.includes('/stream') || e.request.url.includes('/login')) return;
   e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
 });"""
     return Response(sw, media_type="application/javascript")
@@ -94,22 +78,65 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/debug")
-async def debug(token: str = ""):
+@app.websocket("/stream")
+async def stream_ws(websocket: WebSocket, token: str = ""):
     if token != VALID_TOKEN:
-        raise HTTPException(status_code=401)
-    cookie_lines = 0
-    if _COOKIES_FILE:
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+
+    await websocket.accept()
+
+    deepgram = DeepgramClient(DEEPGRAM_API_KEY)
+    dg = deepgram.listen.asyncwebsocket.v("1")
+
+    async def on_transcript(self, result, **kwargs):
         try:
-            with open(_COOKIES_FILE) as f:
-                cookie_lines = sum(1 for l in f if l.strip() and not l.startswith("#"))
+            text = result.channel.alternatives[0].transcript
+            if text and result.is_final:
+                await websocket.send_json({"type": "transcript", "text": text})
         except Exception:
             pass
-    return {
-        "cookies_file": _COOKIES_FILE,
-        "cookie_lines": cookie_lines,
-        "deepgram_key_set": bool(DEEPGRAM_API_KEY),
-    }
+
+    async def on_error(self, error, **kwargs):
+        try:
+            await websocket.send_json({"type": "error", "text": str(error)})
+        except Exception:
+            pass
+
+    dg.on(LiveTranscriptionEvents.Transcript, on_transcript)
+    dg.on(LiveTranscriptionEvents.Error, on_error)
+
+    options = LiveOptions(
+        model="nova-3",
+        language="en-AU",
+        smart_format=True,
+        punctuate=True,
+        encoding="linear16",
+        channels=1,
+        sample_rate=16000,
+        interim_results=False,
+        endpointing=500,
+    )
+
+    await dg.start(options)
+    await websocket.send_json({"type": "status", "text": "Live — transcribing", "live": True})
+
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            await dg.send(data)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "text": str(e)})
+        except Exception:
+            pass
+    finally:
+        try:
+            await dg.finish()
+        except Exception:
+            pass
 
 
 HTML = """<!DOCTYPE html>
@@ -159,312 +186,137 @@ HTML = """<!DOCTYPE html>
       min-height: 100dvh;
       padding: 40px 32px;
     }
-
     .login-wordmark {
       font-size: 12px;
       font-weight: 500;
       letter-spacing: 0.18em;
       text-transform: uppercase;
       margin-bottom: 56px;
-      color: var(--text);
     }
-
-    .login-field {
-      width: 100%;
-      max-width: 300px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+    .login-field { width: 100%; max-width: 300px; display: flex; flex-direction: column; gap: 10px; }
+    .field-label { font-size: 11px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+    input[type="password"] {
+      width: 100%; padding: 13px 14px; font-family: inherit; font-size: 15px;
+      color: var(--text); background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--r); outline: none; transition: border-color 0.15s; -webkit-appearance: none;
     }
-
-    .field-label {
-      font-size: 11px;
-      font-weight: 500;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-
-    input[type="password"], input[type="url"] {
-      width: 100%;
-      padding: 13px 14px;
-      font-family: inherit;
-      font-size: 15px;
-      color: var(--text);
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--r);
-      outline: none;
-      transition: border-color 0.15s;
-      -webkit-appearance: none;
-    }
-    input:focus { border-color: var(--text); }
-    input::placeholder { color: var(--muted); }
-
+    input[type="password"]:focus { border-color: var(--text); }
     .btn-block {
-      width: 100%;
-      padding: 13px;
-      font-family: inherit;
-      font-size: 13px;
-      font-weight: 500;
-      letter-spacing: 0.05em;
-      color: #FFF;
-      background: var(--text);
-      border: none;
-      border-radius: var(--r);
-      cursor: pointer;
-      transition: opacity 0.15s;
-      margin-top: 4px;
+      width: 100%; padding: 13px; font-family: inherit; font-size: 13px; font-weight: 500;
+      letter-spacing: 0.05em; color: #FFF; background: var(--text); border: none;
+      border-radius: var(--r); cursor: pointer; transition: opacity 0.15s; margin-top: 4px;
     }
     .btn-block:active { opacity: 0.72; }
-
-    .login-err {
-      font-size: 12px;
-      color: var(--red);
-      min-height: 16px;
-      text-align: center;
-    }
-
+    .login-err { font-size: 12px; color: var(--red); min-height: 16px; text-align: center; }
     @keyframes shake {
-      0%,100% { transform: translateX(0) }
-      20%      { transform: translateX(-7px) }
-      40%      { transform: translateX(7px) }
-      60%      { transform: translateX(-4px) }
-      80%      { transform: translateX(4px) }
+      0%,100%{transform:translateX(0)} 20%{transform:translateX(-7px)}
+      40%{transform:translateX(7px)} 60%{transform:translateX(-4px)} 80%{transform:translateX(4px)}
     }
     .shake { animation: shake 0.38s ease; }
 
     /* ─── APP SHELL ──────────────────────────────── */
     #app { display: none; flex-direction: column; height: 100dvh; }
-
     header {
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
-      padding: 18px 24px 0;
-      border-bottom: 1px solid var(--border);
-      background: var(--bg);
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      flex-shrink: 0;
+      display: flex; align-items: flex-end; justify-content: space-between;
+      padding: 18px 24px 0; border-bottom: 1px solid var(--border);
+      background: var(--bg); position: sticky; top: 0; z-index: 20; flex-shrink: 0;
     }
-
-    .wordmark {
-      font-size: 11px;
-      font-weight: 500;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
-      padding-bottom: 14px;
-    }
-
+    .wordmark { font-size: 11px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; padding-bottom: 14px; }
     nav { display: flex; }
     .tab {
-      padding: 14px 0;
-      margin-left: 28px;
-      font-size: 13px;
-      font-weight: 400;
-      color: var(--muted);
-      cursor: pointer;
-      border-bottom: 1.5px solid transparent;
-      transition: color 0.15s, border-color 0.15s;
-      user-select: none;
+      padding: 14px 0; margin-left: 28px; font-size: 13px; font-weight: 400;
+      color: var(--muted); cursor: pointer; border-bottom: 1.5px solid transparent;
+      transition: color 0.15s, border-color 0.15s; user-select: none;
     }
     .tab.active { color: var(--text); border-bottom-color: var(--text); }
-
-    .scroll-area {
-      flex: 1;
-      overflow-y: auto;
-      -webkit-overflow-scrolling: touch;
-    }
+    .scroll-area { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 
     /* ─── NEW SESSION ────────────────────────────── */
     #view-new { padding: 32px 24px; display: flex; flex-direction: column; gap: 22px; }
+    .label { font-size: 11px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
 
-    .label {
-      font-size: 11px;
-      font-weight: 500;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 8px;
+    /* Source toggle */
+    .source-toggle { display: flex; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; }
+    .source-opt {
+      flex: 1; padding: 11px 8px; font-family: inherit; font-size: 13px; font-weight: 500;
+      color: var(--muted); background: none; border: none; cursor: pointer;
+      transition: all 0.15s; text-align: center;
     }
+    .source-opt.active { background: var(--text); color: #FFF; }
+    .source-opt:active { opacity: 0.75; }
 
-    .controls { display: flex; gap: 8px; }
-
-    .btn {
-      flex: 1;
-      padding: 12px 10px;
-      font-family: inherit;
-      font-size: 13px;
-      font-weight: 500;
-      letter-spacing: 0.04em;
-      border: 1px solid var(--border);
-      border-radius: var(--r);
-      background: var(--surface);
-      color: var(--text);
-      cursor: pointer;
-      transition: opacity 0.15s;
-    }
-    .btn:active { opacity: 0.65; }
-    .btn.dark   { background: var(--text); color: #FFF; border-color: var(--text); }
-    .btn.stop   { background: var(--red);  color: #FFF; border-color: var(--red); }
-    .btn:disabled { opacity: 0.3; cursor: default; }
-
-    .status {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 18px;
-    }
-    .dot {
-      width: 6px; height: 6px;
-      border-radius: 50%;
-      background: var(--green);
-      flex-shrink: 0;
-      opacity: 0;
-      transition: opacity 0.2s;
-    }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.15} }
-    .dot.on { opacity: 1; animation: pulse 1.8s infinite; }
-    .status-msg { font-size: 12px; color: var(--muted); }
-
-    .transcript-box {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--r);
-      padding: 22px;
-      min-height: 220px;
-      max-height: 52dvh;
-      overflow-y: auto;
-      font-family: 'Georgia', 'Times New Roman', serif;
-      font-size: 16px;
-      line-height: 1.8;
-      color: var(--text);
-      word-break: break-word;
-    }
-    .placeholder { font-family: 'Inter', sans-serif; font-size: 13px; color: var(--muted); }
-
-    /* ─── HISTORY ────────────────────────────────── */
-    #view-history { padding: 32px 24px; display: none; }
-
-    .empty-state {
-      text-align: center;
-      padding: 72px 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.8;
-    }
-
-    .list {
-      display: flex;
-      flex-direction: column;
-      border: 1px solid var(--border);
-      border-radius: var(--r);
-      overflow: hidden;
-      gap: 1px;
-      background: var(--border);
-    }
-
-    .list-item {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      padding: 16px 18px;
-      background: var(--surface);
-      cursor: pointer;
-      transition: background 0.12s;
-    }
-    .list-item:active { background: var(--bg); }
-
-    .item-body { flex: 1; min-width: 0; }
-    .item-title {
-      font-size: 14px;
-      font-weight: 500;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      margin-bottom: 3px;
-    }
-    .item-meta { font-size: 11px; color: var(--muted); letter-spacing: 0.02em; }
-    .item-chevron { color: var(--border); font-size: 18px; flex-shrink: 0; }
-
-    /* ─── TRANSCRIPT DETAIL ──────────────────────── */
-    #view-detail { padding: 32px 24px; display: none; }
-
-    .back {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      font-size: 13px;
-      color: var(--muted);
-      cursor: pointer;
-      background: none;
-      border: none;
-      font-family: inherit;
-      margin-bottom: 28px;
-      padding: 0;
-    }
-
-    .detail-title { font-size: 21px; font-weight: 400; margin-bottom: 6px; }
-    .detail-meta { font-size: 12px; color: var(--muted); margin-bottom: 28px; letter-spacing: 0.02em; }
-    .detail-body {
-      font-family: 'Georgia', 'Times New Roman', serif;
-      font-size: 16px;
-      line-height: 1.85;
-      white-space: pre-wrap;
-      word-break: break-word;
-      margin-bottom: 36px;
-    }
-    .detail-actions { display: flex; gap: 8px; padding-bottom: calc(32px + var(--sb)); }
-    .btn-del { color: var(--red) !important; border-color: currentColor !important; }
-
-    /* ─── DURATION PICKER ───────────────────────── */
-    .duration-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
+    /* Duration */
+    .dur-row { display: flex; align-items: center; gap: 10px; }
     input[type="number"] {
-      width: 80px;
-      padding: 11px 12px;
-      font-family: inherit;
-      font-size: 15px;
-      color: var(--text);
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--r);
-      outline: none;
-      -webkit-appearance: none;
-      transition: border-color 0.15s;
+      width: 76px; padding: 11px 12px; font-family: inherit; font-size: 15px;
+      color: var(--text); background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--r); outline: none; -webkit-appearance: none; transition: border-color 0.15s;
     }
     input[type="number"]:focus { border-color: var(--text); }
     .dur-label { font-size: 13px; color: var(--muted); }
 
-    .countdown {
-      font-size: 12px;
-      color: var(--muted);
-      font-variant-numeric: tabular-nums;
-      margin-left: auto;
-      flex-shrink: 0;
+    /* Controls */
+    .controls { display: flex; gap: 8px; }
+    .btn {
+      flex: 1; padding: 12px 10px; font-family: inherit; font-size: 13px; font-weight: 500;
+      letter-spacing: 0.04em; border: 1px solid var(--border); border-radius: var(--r);
+      background: var(--surface); color: var(--text); cursor: pointer; transition: opacity 0.15s;
     }
+    .btn:active { opacity: 0.65; }
+    .btn.dark { background: var(--text); color: #FFF; border-color: var(--text); }
+    .btn.stop { background: var(--red); color: #FFF; border-color: var(--red); }
+
+    /* Status */
+    .status { display: flex; align-items: center; gap: 8px; min-height: 18px; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex-shrink: 0; opacity: 0; transition: opacity 0.2s; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.15} }
+    .dot.on { opacity: 1; animation: pulse 1.8s infinite; }
+    .status-msg { font-size: 12px; color: var(--muted); }
+    .countdown { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
     .countdown.warn { color: var(--red); }
+
+    /* Transcript box */
+    .transcript-box {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+      padding: 22px; min-height: 220px; max-height: 52dvh; overflow-y: auto;
+      font-family: 'Georgia', 'Times New Roman', serif; font-size: 16px; line-height: 1.8;
+      color: var(--text); word-break: break-word;
+    }
+    .placeholder { font-family: 'Inter', sans-serif; font-size: 13px; color: var(--muted); }
+
+    /* Hint box */
+    .hint {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+      padding: 14px 16px; font-size: 13px; color: var(--muted); line-height: 1.6;
+    }
+    .hint strong { color: var(--text); font-weight: 500; }
+
+    /* ─── HISTORY ────────────────────────────────── */
+    #view-history { padding: 32px 24px; display: none; }
+    .empty-state { text-align: center; padding: 72px 0; color: var(--muted); font-size: 13px; line-height: 1.8; }
+    .list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; gap: 1px; background: var(--border); }
+    .list-item { display: flex; align-items: center; gap: 14px; padding: 16px 18px; background: var(--surface); cursor: pointer; transition: background 0.12s; }
+    .list-item:active { background: var(--bg); }
+    .item-body { flex: 1; min-width: 0; }
+    .item-title { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 3px; }
+    .item-meta { font-size: 11px; color: var(--muted); letter-spacing: 0.02em; }
+    .item-chevron { color: var(--border); font-size: 18px; flex-shrink: 0; }
+
+    /* ─── DETAIL ─────────────────────────────────── */
+    #view-detail { padding: 32px 24px; display: none; }
+    .back { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); cursor: pointer; background: none; border: none; font-family: inherit; margin-bottom: 28px; padding: 0; }
+    .detail-title { font-size: 21px; font-weight: 400; margin-bottom: 6px; }
+    .detail-meta { font-size: 12px; color: var(--muted); margin-bottom: 28px; letter-spacing: 0.02em; }
+    .detail-body { font-family: 'Georgia', 'Times New Roman', serif; font-size: 16px; line-height: 1.85; white-space: pre-wrap; word-break: break-word; margin-bottom: 36px; }
+    .detail-actions { display: flex; gap: 8px; padding-bottom: calc(32px + var(--sb)); }
+    .btn-del { color: var(--red) !important; border-color: currentColor !important; }
 
     /* ─── TOAST ──────────────────────────────────── */
     #toast {
-      position: fixed;
-      bottom: calc(28px + var(--sb));
-      left: 50%;
-      transform: translateX(-50%) translateY(60px);
-      background: var(--text);
-      color: #FFF;
-      padding: 9px 18px;
-      border-radius: 100px;
-      font-size: 13px;
-      font-weight: 500;
-      white-space: nowrap;
-      pointer-events: none;
-      z-index: 99;
+      position: fixed; bottom: calc(28px + var(--sb)); left: 50%;
+      transform: translateX(-50%) translateY(60px); background: var(--text); color: #FFF;
+      padding: 9px 18px; border-radius: 100px; font-size: 13px; font-weight: 500;
+      white-space: nowrap; pointer-events: none; z-index: 99;
       transition: transform 0.28s cubic-bezier(0.34, 1.4, 0.64, 1);
     }
     #toast.show { transform: translateX(-50%) translateY(0); }
@@ -472,7 +324,7 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
 
-<!-- ── LOGIN ── -->
+<!-- LOGIN -->
 <div id="login-view">
   <div class="login-wordmark">Verbatim</div>
   <div class="login-field">
@@ -483,7 +335,7 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- ── APP ── -->
+<!-- APP -->
 <div id="app">
   <header>
     <div class="wordmark">Verbatim</div>
@@ -497,23 +349,34 @@ HTML = """<!DOCTYPE html>
 
     <!-- New -->
     <div id="view-new">
+
       <div>
-        <div class="label">Stream URL</div>
-        <input type="url" id="streamUrl" placeholder="Paste YouTube or stream URL" autocomplete="off" autocorrect="off" autocapitalize="off">
+        <div class="label">Audio source</div>
+        <div class="source-toggle">
+          <button class="source-opt active" id="src-tab" onclick="setSrc('tab')">Tab / Screen</button>
+          <button class="source-opt" id="src-mic" onclick="setSrc('mic')">Microphone</button>
+        </div>
+      </div>
+
+      <div id="hint-tab" class="hint">
+        <strong>How it works:</strong> click Start, then pick the browser tab or window playing the audio. Works with YouTube, the RBA site, or anything else.
+      </div>
+      <div id="hint-mic" class="hint" style="display:none">
+        <strong>Microphone mode:</strong> your device mic will be used. On a phone, hold it near the speaker playing the audio.
       </div>
 
       <div>
         <div class="label">Duration</div>
-        <div class="duration-row">
+        <div class="dur-row">
           <input type="number" id="durInput" value="60" min="1" max="480">
-          <span class="dur-label">minutes — leave blank or 0 for no limit</span>
+          <span class="dur-label">minutes &nbsp;·&nbsp; 0 for no limit</span>
         </div>
       </div>
 
       <div class="controls">
         <button class="btn dark" id="startBtn" onclick="startSession()">Start</button>
-        <button class="btn stop"  id="stopBtn"  onclick="stopSession()"  style="display:none">Stop</button>
-        <button class="btn"       id="copyBtn"  onclick="copyText()"     style="display:none">Copy</button>
+        <button class="btn stop" id="stopBtn" onclick="stopSession()" style="display:none">Stop</button>
+        <button class="btn" id="copyBtn" onclick="copyText()" style="display:none">Copy</button>
       </div>
 
       <div class="status">
@@ -525,6 +388,7 @@ HTML = """<!DOCTYPE html>
       <div class="transcript-box" id="transcriptBox">
         <span class="placeholder">Transcript will appear here as audio is detected.</span>
       </div>
+
     </div>
 
     <!-- History -->
@@ -537,8 +401,8 @@ HTML = """<!DOCTYPE html>
     <div id="view-detail">
       <button class="back" onclick="nav('history')">&#8592; History</button>
       <div class="detail-title" id="detailTitle"></div>
-      <div class="detail-meta"  id="detailMeta"></div>
-      <div class="detail-body"  id="detailBody"></div>
+      <div class="detail-meta" id="detailMeta"></div>
+      <div class="detail-body" id="detailBody"></div>
       <div class="detail-actions">
         <button class="btn dark" onclick="copyDetail()">Copy text</button>
         <button class="btn btn-del" onclick="deleteDetail()">Delete</button>
@@ -553,44 +417,9 @@ HTML = """<!DOCTYPE html>
 <script>
 const TOKEN_KEY   = 'vb_token';
 const HISTORY_KEY = 'vb_history';
-let es = null, buffer = '', activeId = null, toastTimer;
-let timerInterval = null, timerEnd = null;
-
-function getDurMins() {
-  const v = parseInt(document.getElementById('durInput').value, 10);
-  return isNaN(v) ? 0 : v;
-}
-
-function startTimer() {
-  clearInterval(timerInterval);
-  const cdEl = document.getElementById('countdown');
-  const durMins = getDurMins();
-  if (!durMins) { cdEl.textContent = ''; return; }
-  timerEnd = Date.now() + durMins * 60 * 1000;
-  function tick() {
-    const remaining = timerEnd - Date.now();
-    if (remaining <= 0) {
-      cdEl.textContent = '0:00';
-      endSession();
-      return;
-    }
-    const m = Math.floor(remaining / 60000);
-    const s = Math.floor((remaining % 60000) / 1000).toString().padStart(2, '0');
-    cdEl.textContent = m + ':' + s;
-    cdEl.classList.toggle('warn', remaining < 60000);
-  }
-  tick();
-  timerInterval = setInterval(tick, 1000);
-}
-
-function stopTimer() {
-  clearInterval(timerInterval);
-  timerInterval = null;
-  timerEnd = null;
-  const cdEl = document.getElementById('countdown');
-  cdEl.textContent = '';
-  cdEl.classList.remove('warn');
-}
+let ws = null, audioCtx = null, mediaStream = null;
+let buffer = '', activeId = null, toastTimer;
+let timerInterval = null, currentSrc = 'tab';
 
 /* ── Auth ──────────────────────────────────────── */
 async function doLogin() {
@@ -600,11 +429,11 @@ async function doLogin() {
   try {
     const r = await fetch('/login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pass })
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pass})
     });
     if (!r.ok) throw new Error();
-    const { token } = await r.json();
+    const {token} = await r.json();
     localStorage.setItem(TOKEN_KEY, token);
     boot();
   } catch {
@@ -622,18 +451,14 @@ document.getElementById('loginPass').addEventListener('keydown', e => {
 
 function boot() {
   document.getElementById('login-view').style.display = 'none';
-  const a = document.getElementById('app');
-  a.style.display = 'flex';
+  document.getElementById('app').style.display = 'flex';
   nav('new');
 }
 
-(function init() {
-  if (localStorage.getItem(TOKEN_KEY)) boot();
-})();
+(function init() { if (localStorage.getItem(TOKEN_KEY)) boot(); })();
 
 /* ── Navigation ────────────────────────────────── */
 const VIEWS = ['new', 'history', 'detail'];
-
 function nav(name) {
   VIEWS.forEach(v => {
     document.getElementById('view-' + v).style.display = 'none';
@@ -646,38 +471,128 @@ function nav(name) {
   if (name === 'history') renderHistory();
 }
 
-/* ── Transcription ─────────────────────────────── */
-function startSession() {
-  const url = document.getElementById('streamUrl').value.trim();
-  if (!url) { toast('Paste a stream URL first'); return; }
+/* ── Source toggle ─────────────────────────────── */
+function setSrc(src) {
+  currentSrc = src;
+  document.getElementById('src-tab').classList.toggle('active', src === 'tab');
+  document.getElementById('src-mic').classList.toggle('active', src === 'mic');
+  document.getElementById('hint-tab').style.display = src === 'tab' ? 'block' : 'none';
+  document.getElementById('hint-mic').style.display = src === 'mic' ? 'block' : 'none';
+}
 
+/* ── Timer ─────────────────────────────────────── */
+function getDurMins() {
+  const v = parseInt(document.getElementById('durInput').value, 10);
+  return isNaN(v) ? 0 : v;
+}
+
+function startTimer() {
+  clearInterval(timerInterval);
+  const cdEl = document.getElementById('countdown');
+  const mins = getDurMins();
+  if (!mins) { cdEl.textContent = ''; return; }
+  const end = Date.now() + mins * 60000;
+  function tick() {
+    const rem = end - Date.now();
+    if (rem <= 0) { cdEl.textContent = '0:00'; stopSession(); return; }
+    const m = Math.floor(rem / 60000);
+    const s = Math.floor((rem % 60000) / 1000).toString().padStart(2, '0');
+    cdEl.textContent = m + ':' + s;
+    cdEl.classList.toggle('warn', rem < 60000);
+  }
+  tick();
+  timerInterval = setInterval(tick, 1000);
+}
+
+function stopTimer() {
+  clearInterval(timerInterval);
+  timerInterval = null;
+  const cdEl = document.getElementById('countdown');
+  cdEl.textContent = '';
+  cdEl.classList.remove('warn');
+}
+
+/* ── Transcription ─────────────────────────────── */
+async function startSession() {
+  setStatus('Requesting audio…', false);
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('copyBtn').style.display = 'none';
+
+  let stream;
+  try {
+    if (currentSrc === 'tab') {
+      stream = await navigator.mediaDevices.getDisplayMedia({audio: true, video: true});
+      // Stop any video tracks — we only want audio
+      stream.getVideoTracks().forEach(t => t.stop());
+    } else {
+      stream = await navigator.mediaDevices.getUserMedia({audio: true, video: false});
+    }
+  } catch (e) {
+    setStatus('Audio access denied', false);
+    document.getElementById('startBtn').style.display = 'block';
+    return;
+  }
+
+  if (!stream.getAudioTracks().length) {
+    setStatus('No audio track found — make sure to share a tab with audio', false);
+    document.getElementById('startBtn').style.display = 'block';
+    stream.getTracks().forEach(t => t.stop());
+    return;
+  }
+
+  mediaStream = stream;
   buffer = '';
   renderBuffer();
-  document.getElementById('startBtn').style.display = 'none';
-  document.getElementById('stopBtn').style.display  = 'block';
-  document.getElementById('copyBtn').style.display  = 'none';
+  document.getElementById('stopBtn').style.display = 'block';
   setStatus('Connecting…', false);
 
   const token = localStorage.getItem(TOKEN_KEY);
-  es = new EventSource('/transcribe?url=' + encodeURIComponent(url) + '&token=' + encodeURIComponent(token));
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/stream?token=' + encodeURIComponent(token));
+  ws.binaryType = 'arraybuffer';
 
-  es.onmessage = ({ data }) => {
-    const d = JSON.parse(data);
-    if      (d.type === 'status')     { setStatus(d.text, d.live || false); if (d.live) startTimer(); }
-    else if (d.type === 'transcript') { buffer += d.text + ' '; renderBuffer(); }
-    else if (d.type === 'error')      { setStatus('Error: ' + d.text, false); endSession(); }
-    else if (d.type === 'done')       { setStatus('Complete', false); endSession(); }
+  ws.onopen = () => {
+    // Set up AudioContext to capture PCM at 16 kHz
+    audioCtx = new AudioContext({sampleRate: 16000});
+    const src = audioCtx.createMediaStreamSource(stream);
+    const proc = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    proc.onaudioprocess = e => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const f32 = e.inputBuffer.getChannelData(0);
+      const i16 = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+        i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+      }
+      ws.send(i16.buffer);
+    };
+
+    src.connect(proc);
+    proc.connect(audioCtx.destination);
   };
-  es.onerror = () => { setStatus('Connection lost', false); endSession(); };
+
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'status')     { setStatus(d.text, d.live || false); if (d.live) startTimer(); }
+    else if (d.type === 'transcript') { buffer += d.text + ' '; renderBuffer(); }
+    else if (d.type === 'error') { setStatus('Error: ' + d.text, false); endSession(); }
+  };
+
+  ws.onclose = () => endSession();
+
+  // If the user stops sharing via the browser's built-in button
+  stream.getAudioTracks()[0].addEventListener('ended', () => endSession());
 }
 
 function stopSession() { endSession(); }
 
 function endSession() {
-  if (es) { es.close(); es = null; }
+  if (ws) { ws.close(); ws = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
   stopTimer();
   document.getElementById('startBtn').style.display = 'block';
-  document.getElementById('stopBtn').style.display  = 'none';
+  document.getElementById('stopBtn').style.display = 'none';
   document.getElementById('dot').classList.remove('on');
   const text = buffer.trim();
   if (text) {
@@ -715,14 +630,7 @@ function persist(text) {
   const h = getHistory();
   const words = text.split(/[\s]+/);
   const preview = words.slice(0, 7).join(' ') + (words.length > 7 ? '…' : '');
-  const entry = {
-    id:        Date.now().toString(),
-    title:     preview,
-    content:   text,
-    createdAt: new Date().toISOString(),
-    words:     words.length
-  };
-  h.unshift(entry);
+  h.unshift({ id: Date.now().toString(), title: preview, content: text, createdAt: new Date().toISOString(), words: words.length });
   localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 100)));
 }
 
@@ -739,7 +647,7 @@ function renderHistory() {
         <div class="item-title">${esc(t.title)}</div>
         <div class="item-meta">${fmtDate(t.createdAt)}&nbsp;&middot;&nbsp;${t.words.toLocaleString()} words</div>
       </div>
-      <div class="item-chevron">›</div>
+      <div class="item-chevron">&#8250;</div>
     </div>`).join('') + '</div>';
 }
 
@@ -748,8 +656,8 @@ function openDetail(id) {
   if (!t) return;
   activeId = id;
   document.getElementById('detailTitle').textContent = t.title;
-  document.getElementById('detailMeta').textContent  = fmtDate(t.createdAt) + ' · ' + t.words.toLocaleString() + ' words';
-  document.getElementById('detailBody').textContent  = t.content;
+  document.getElementById('detailMeta').textContent = fmtDate(t.createdAt) + ' · ' + t.words.toLocaleString() + ' words';
+  document.getElementById('detailBody').textContent = t.content;
   nav('detail');
 }
 
@@ -766,17 +674,12 @@ function deleteDetail() {
 }
 
 /* ── Helpers ───────────────────────────────────── */
-function esc(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function fmtDate(iso) {
   return new Date(iso).toLocaleDateString('en-AU', {
-    weekday: 'short', day: 'numeric', month: 'short',
-    hour: '2-digit', minute: '2-digit'
+    weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
   });
 }
-
 function toast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
@@ -785,7 +688,6 @@ function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
 }
 
-/* ── PWA ───────────────────────────────────────── */
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
@@ -797,166 +699,3 @@ if ('serviceWorker' in navigator) {
 @app.get("/")
 async def index():
     return HTMLResponse(HTML)
-
-
-@app.get("/transcribe")
-async def transcribe(url: str, request: Request, token: str = ""):
-    if token != VALID_TOKEN:
-        async def unauth():
-            yield {"data": json.dumps({"type": "error", "text": "Unauthorized — please log in again"})}
-        return EventSourceResponse(unauth())
-
-    async def generate():
-        queue: asyncio.Queue = asyncio.Queue()
-        ffmpeg_proc = None
-        dg_connection = None
-
-        try:
-            yield {"data": json.dumps({"type": "status", "text": "Extracting stream audio…"})}
-
-            loop = asyncio.get_event_loop()
-
-            def get_audio_url():
-                # Try progressively: cookies → ios client → android client
-                attempts = [
-                    {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-                    {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-                    {"extractor_args": {"youtube": {"player_client": ["web_creator"]}}},
-                    {},  # bare fallback
-                ]
-                base = {"format": "bestaudio/best", "quiet": True, "no_warnings": True}
-                if _COOKIES_FILE:
-                    base["cookiefile"] = _COOKIES_FILE
-
-                last_err = None
-                for extra in attempts:
-                    opts = {**base, **extra}
-                    try:
-                        with yt_dlp.YoutubeDL(opts) as ydl:
-                            info = ydl.extract_info(url, download=False)
-                            if "entries" in info:
-                                info = info["entries"][0]
-                            audio = info.get("url") or info.get("manifest_url")
-                            if audio:
-                                return audio
-                    except Exception as e:
-                        last_err = e
-                        continue
-                if last_err:
-                    raise last_err
-                return None
-
-            audio_url = await loop.run_in_executor(None, get_audio_url)
-
-            if not audio_url:
-                yield {"data": json.dumps({"type": "error", "text": "Could not extract audio from URL"})}
-                return
-
-            yield {"data": json.dumps({"type": "status", "text": "Connecting to Deepgram…"})}
-
-            deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-            dg_connection = deepgram.listen.asyncwebsocket.v("1")
-
-            async def on_transcript(self, result, **kwargs):
-                try:
-                    text = result.channel.alternatives[0].transcript
-                    if text and result.is_final:
-                        await queue.put(("transcript", text))
-                except Exception:
-                    pass
-
-            async def on_error(self, error, **kwargs):
-                await queue.put(("error", str(error)))
-
-            async def on_close(self, close, **kwargs):
-                await queue.put(("done", None))
-
-            dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
-            dg_connection.on(LiveTranscriptionEvents.Error, on_error)
-            dg_connection.on(LiveTranscriptionEvents.Close, on_close)
-
-            options = LiveOptions(
-                model="nova-3",
-                language="en-AU",
-                smart_format=True,
-                punctuate=True,
-                encoding="linear16",
-                channels=1,
-                sample_rate=16000,
-                interim_results=False,
-                endpointing=500,
-            )
-
-            if not await dg_connection.start(options):
-                yield {"data": json.dumps({"type": "error", "text": "Failed to connect to Deepgram"})}
-                return
-
-            yield {"data": json.dumps({"type": "status", "text": "Live — transcribing", "live": True})}
-
-            ffmpeg_proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-                "-i", audio_url,
-                "-vn",
-                "-ar", "16000",
-                "-ac", "1",
-                "-f", "s16le",
-                "pipe:1",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-
-            # Feed ffmpeg audio inline — avoids background task cancellation issues
-            while True:
-                if await request.is_disconnected():
-                    break
-
-                # Read a chunk from ffmpeg (short timeout so we can also drain transcripts)
-                try:
-                    chunk = await asyncio.wait_for(
-                        ffmpeg_proc.stdout.read(8192), timeout=0.2
-                    )
-                except asyncio.TimeoutError:
-                    chunk = b""
-
-                if chunk:
-                    await dg_connection.send(chunk)
-                elif chunk == b"":
-                    pass  # timeout — keep looping
-                else:
-                    # ffmpeg stream ended
-                    await queue.put(("done", None))
-
-                # Drain any available transcripts without blocking
-                while True:
-                    try:
-                        kind, text = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if kind == "transcript":
-                        yield {"data": json.dumps({"type": "transcript", "text": text})}
-                    elif kind == "done":
-                        yield {"data": json.dumps({"type": "done"})}
-                        return
-                    elif kind == "error":
-                        yield {"data": json.dumps({"type": "error", "text": text})}
-                        return
-
-        except Exception as e:
-            yield {"data": json.dumps({"type": "error", "text": str(e)})}
-        finally:
-            if ffmpeg_proc:
-                try:
-                    ffmpeg_proc.kill()
-                    await ffmpeg_proc.wait()
-                except Exception:
-                    pass
-            if dg_connection:
-                try:
-                    await dg_connection.finish()
-                except Exception:
-                    pass
-
-    return EventSourceResponse(generate())
