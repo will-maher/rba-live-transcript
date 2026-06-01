@@ -1,7 +1,7 @@
 import asyncio
+import hashlib
 import json
 import os
-import secrets
 import tempfile
 
 import yt_dlp
@@ -14,6 +14,9 @@ from sse_starlette.sse import EventSourceResponse
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "verbatim")
 
+# Deterministic token derived from password — survives redeploys
+VALID_TOKEN = hashlib.sha256(f"verbatim:{APP_PASSWORD}".encode()).hexdigest()
+
 # Write YouTube cookies to a temp file once at startup if provided
 _COOKIES_FILE: str | None = None
 _yt_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
@@ -24,7 +27,6 @@ if _yt_cookies:
     _COOKIES_FILE = _tmp.name
 
 app = FastAPI()
-valid_tokens: set[str] = set()
 
 
 class LoginRequest(BaseModel):
@@ -35,9 +37,7 @@ class LoginRequest(BaseModel):
 async def login(req: LoginRequest):
     if req.password != APP_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid password")
-    token = secrets.token_hex(32)
-    valid_tokens.add(token)
-    return {"token": token}
+    return {"token": VALID_TOKEN}
 
 
 @app.get("/manifest.json")
@@ -781,7 +781,7 @@ async def index():
 
 @app.get("/transcribe")
 async def transcribe(url: str, request: Request, token: str = ""):
-    if token not in valid_tokens:
+    if token != VALID_TOKEN:
         async def unauth():
             yield {"data": json.dumps({"type": "error", "text": "Unauthorized — please log in again"})}
         return EventSourceResponse(unauth())
