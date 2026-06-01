@@ -402,29 +402,24 @@ HTML = """<!DOCTYPE html>
     /* ─── DURATION PICKER ───────────────────────── */
     .duration-row {
       display: flex;
-      gap: 6px;
+      align-items: center;
+      gap: 10px;
     }
-    .dur {
-      flex: 1;
-      padding: 9px 4px;
+    input[type="number"] {
+      width: 80px;
+      padding: 11px 12px;
       font-family: inherit;
-      font-size: 12px;
-      font-weight: 500;
-      letter-spacing: 0.04em;
+      font-size: 15px;
+      color: var(--text);
+      background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--r);
-      background: var(--surface);
-      color: var(--muted);
-      cursor: pointer;
-      transition: all 0.12s;
-      text-align: center;
+      outline: none;
+      -webkit-appearance: none;
+      transition: border-color 0.15s;
     }
-    .dur.selected {
-      background: var(--text);
-      border-color: var(--text);
-      color: #FFF;
-    }
-    .dur:active { opacity: 0.7; }
+    input[type="number"]:focus { border-color: var(--text); }
+    .dur-label { font-size: 13px; color: var(--muted); }
 
     .countdown {
       font-size: 12px;
@@ -490,11 +485,8 @@ HTML = """<!DOCTYPE html>
       <div>
         <div class="label">Duration</div>
         <div class="duration-row">
-          <div class="dur selected" data-mins="30"  onclick="setDur(this)">30 m</div>
-          <div class="dur"          data-mins="60"  onclick="setDur(this)">1 hr</div>
-          <div class="dur"          data-mins="90"  onclick="setDur(this)">90 m</div>
-          <div class="dur"          data-mins="120" onclick="setDur(this)">2 hr</div>
-          <div class="dur"          data-mins="0"   onclick="setDur(this)">∞</div>
+          <input type="number" id="durInput" value="60" min="1" max="480">
+          <span class="dur-label">minutes — leave blank or 0 for no limit</span>
         </div>
       </div>
 
@@ -542,18 +534,17 @@ HTML = """<!DOCTYPE html>
 const TOKEN_KEY   = 'vb_token';
 const HISTORY_KEY = 'vb_history';
 let es = null, buffer = '', activeId = null, toastTimer;
-let durMins = 30, timerInterval = null, timerEnd = null;
+let timerInterval = null, timerEnd = null;
 
-/* ── Duration picker ───────────────────────────── */
-function setDur(el) {
-  document.querySelectorAll('.dur').forEach(d => d.classList.remove('selected'));
-  el.classList.add('selected');
-  durMins = parseInt(el.dataset.mins, 10);
+function getDurMins() {
+  const v = parseInt(document.getElementById('durInput').value, 10);
+  return isNaN(v) ? 0 : v;
 }
 
 function startTimer() {
   clearInterval(timerInterval);
   const cdEl = document.getElementById('countdown');
+  const durMins = getDurMins();
   if (!durMins) { cdEl.textContent = ''; return; }
   timerEnd = Date.now() + durMins * 60 * 1000;
   function tick() {
@@ -877,38 +868,41 @@ async def transcribe(url: str, request: Request, token: str = ""):
                 stderr=asyncio.subprocess.DEVNULL,
             )
 
-            async def feed():
-                try:
-                    while True:
-                        chunk = await ffmpeg_proc.stdout.read(8192)
-                        if not chunk:
-                            break
-                        await dg_connection.send(chunk)
-                        if await request.is_disconnected():
-                            break
-                except Exception:
-                    pass
-                finally:
-                    await queue.put(("done", None))
-
-            asyncio.create_task(feed())
-
+            # Feed ffmpeg audio inline — avoids background task cancellation issues
             while True:
                 if await request.is_disconnected():
                     break
-                try:
-                    kind, text = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
 
-                if kind == "transcript":
-                    yield {"data": json.dumps({"type": "transcript", "text": text})}
-                elif kind == "done":
-                    yield {"data": json.dumps({"type": "done"})}
-                    break
-                elif kind == "error":
-                    yield {"data": json.dumps({"type": "error", "text": text})}
-                    break
+                # Read a chunk from ffmpeg (short timeout so we can also drain transcripts)
+                try:
+                    chunk = await asyncio.wait_for(
+                        ffmpeg_proc.stdout.read(8192), timeout=0.2
+                    )
+                except asyncio.TimeoutError:
+                    chunk = b""
+
+                if chunk:
+                    await dg_connection.send(chunk)
+                elif chunk == b"":
+                    pass  # timeout — keep looping
+                else:
+                    # ffmpeg stream ended
+                    await queue.put(("done", None))
+
+                # Drain any available transcripts without blocking
+                while True:
+                    try:
+                        kind, text = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if kind == "transcript":
+                        yield {"data": json.dumps({"type": "transcript", "text": text})}
+                    elif kind == "done":
+                        yield {"data": json.dumps({"type": "done"})}
+                        return
+                    elif kind == "error":
+                        yield {"data": json.dumps({"type": "error", "text": text})}
+                        return
 
         except Exception as e:
             yield {"data": json.dumps({"type": "error", "text": str(e)})}
