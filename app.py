@@ -548,6 +548,7 @@ HTML = """<!DOCTYPE html>
         <button class="btn dark" id="startBtn" onclick="startSession()">Start</button>
         <button class="btn stop" id="stopBtn" onclick="stopSession()" style="display:none">Stop</button>
         <button class="btn" id="copyBtn" onclick="copyText()" style="display:none">Copy</button>
+        <button class="btn" id="clearBtn" onclick="clearSession()" style="display:none">New session</button>
       </div>
 
       <div class="status">
@@ -726,6 +727,7 @@ async function startSession() {
   setStatus('Requesting audio…', false);
   document.getElementById('startBtn').style.display = 'none';
   document.getElementById('copyBtn').style.display = 'none';
+  document.getElementById('clearBtn').style.display = 'none';
 
   let stream;
   try {
@@ -812,9 +814,18 @@ function endSession() {
   const text = buffer.trim();
   if (text) {
     document.getElementById('copyBtn').style.display = 'block';
+    document.getElementById('clearBtn').style.display = 'block';
     persistSession(text).then(() => toast('Saved to history'));
   }
   currentSessionId = null;
+}
+
+function clearSession() {
+  buffer = '';
+  renderBuffer();
+  document.getElementById('copyBtn').style.display = 'none';
+  document.getElementById('clearBtn').style.display = 'none';
+  setStatus('Ready', false);
 }
 
 function renderBuffer() {
