@@ -118,7 +118,11 @@ async def stream_ws(websocket: WebSocket, token: str = ""):
         endpointing=500,
     )
 
-    await dg.start(options)
+    started = await dg.start(options)
+    if not started:
+        await websocket.send_json({"type": "error", "text": "Failed to connect to Deepgram — check API key"})
+        await websocket.close()
+        return
     await websocket.send_json({"type": "status", "text": "Live — transcribing", "live": True})
 
     try:
@@ -135,7 +139,7 @@ async def stream_ws(websocket: WebSocket, token: str = ""):
     finally:
         try:
             await dg.finish()
-        except Exception:
+        except BaseException:
             pass
 
 
