@@ -601,8 +601,6 @@ function boot() {
   nav('new');
 }
 
-(function init() { if (localStorage.getItem(TOKEN_KEY)) boot(); })();
-
 /* ── Navigation ────────────────────────────────── */
 const VIEWS = ['new', 'history', 'detail'];
 function nav(name) {
@@ -873,6 +871,10 @@ function toast(msg) {
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
+
+/* Restore session if already logged in — runs last so every
+   const/let above (VIEWS, historyCache, …) is initialised first. */
+if (localStorage.getItem(TOKEN_KEY)) boot();
 </script>
 </body>
 </html>"""
