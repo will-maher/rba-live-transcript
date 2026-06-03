@@ -63,6 +63,12 @@ class TranscriptIn(BaseModel):
     words: int
 
 
+class TranscriptUpdate(BaseModel):
+    title: str
+    content: str
+    words: int
+
+
 def require_token(token: str):
     if token != VALID_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -113,6 +119,19 @@ async def add_history(item: TranscriptIn, token: str = ""):
             item.words,
         )
     return {"id": row["id"], "createdAt": row["created_at"].isoformat()}
+
+
+@app.patch("/history/{tid}")
+async def update_history(tid: str, item: TranscriptUpdate, token: str = ""):
+    require_token(token)
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="History sync not configured")
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE transcripts SET title=$1, content=$2, words=$3 WHERE id=$4",
+            item.title, item.content, item.words, tid,
+        )
+    return {"ok": True}
 
 
 @app.delete("/history/{tid}")
@@ -569,11 +588,14 @@ HTML = """<!DOCTYPE html>
 <script>
 const TOKEN_KEY   = 'vb_token';
 const HISTORY_KEY = 'vb_history';
+const CHUNK_MS    = 2 * 60 * 1000; // auto-save every 2 minutes
+
 let ws = null, audioCtx = null, mediaStream = null;
 let buffer = '', activeId = null, toastTimer;
 let timerInterval = null, currentSrc = 'tab';
 let historyCache = [];
 let sessionActive = false;
+let currentSessionId = null, chunkInterval = null;
 
 /* Authed fetch helper — appends token query param */
 function api(path, opts) {
@@ -729,8 +751,10 @@ async function startSession() {
 
   mediaStream = stream;
   sessionActive = true;
+  currentSessionId = null;
   buffer = '';
   renderBuffer();
+  startChunking();
   document.getElementById('stopBtn').style.display = 'block';
   setStatus('Connecting…', false);
 
@@ -777,6 +801,7 @@ function stopSession() { endSession(); }
 function endSession() {
   if (!sessionActive) return;   // guard against double-fire (Stop + ws.onclose + track 'ended')
   sessionActive = false;
+  stopChunking();
   if (ws) { ws.close(); ws = null; }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
@@ -787,9 +812,9 @@ function endSession() {
   const text = buffer.trim();
   if (text) {
     document.getElementById('copyBtn').style.display = 'block';
-    persist(text);
-    toast('Saved to history');
+    persistSession(text).then(() => toast('Saved to history'));
   }
+  currentSessionId = null;
 }
 
 function renderBuffer() {
@@ -831,26 +856,66 @@ async function loadHistory() {
   renderHistory();
 }
 
-async function persist(text) {
-  const words = text.split(/\\s+/).filter(Boolean);
+/* Create or update the current session's history record.
+   First call creates; subsequent calls patch the same entry. */
+async function persistSession(text) {
+  const words = text.split(/\s+/).filter(Boolean);
   const preview = words.slice(0, 7).join(' ') + (words.length > 7 ? '…' : '');
   const item = { title: preview, content: text, words: words.length };
-  try {
-    const r = await api('/history', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(item)
-    });
-    if (!r.ok) throw new Error('server ' + r.status);
-    const {id, createdAt} = await r.json();
-    historyCache.unshift({ ...item, id, createdAt });
-  } catch {
-    const local = { ...item, id: Date.now().toString(), createdAt: new Date().toISOString() };
+
+  if (currentSessionId) {
+    // Update existing record
+    try {
+      const r = await api('/history/' + encodeURIComponent(currentSessionId), {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(item)
+      });
+      if (!r.ok) throw new Error('server ' + r.status);
+    } catch { /* ignore chunk errors — final save will retry */ }
+    const idx = historyCache.findIndex(x => x.id === currentSessionId);
+    if (idx >= 0) Object.assign(historyCache[idx], item);
+    // localStorage mirror
     const h = getLocalHistory();
-    h.unshift(local);
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 100)));
-    historyCache.unshift(local);
+    const li = h.findIndex(x => x.id === currentSessionId);
+    if (li >= 0) { Object.assign(h[li], item); localStorage.setItem(HISTORY_KEY, JSON.stringify(h)); }
+  } else {
+    // Create new record
+    try {
+      const r = await api('/history', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(item)
+      });
+      if (!r.ok) throw new Error('server ' + r.status);
+      const {id, createdAt} = await r.json();
+      currentSessionId = id;
+      historyCache.unshift({ ...item, id, createdAt });
+      // Mirror to localStorage too
+      const h = getLocalHistory();
+      h.unshift({ ...item, id, createdAt });
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 100)));
+    } catch {
+      const local = { ...item, id: Date.now().toString(), createdAt: new Date().toISOString() };
+      const h = getLocalHistory();
+      h.unshift(local);
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 100)));
+      historyCache.unshift(local);
+      currentSessionId = local.id;
+    }
   }
+}
+
+function startChunking() {
+  stopChunking();
+  chunkInterval = setInterval(() => {
+    const text = buffer.trim();
+    if (text) persistSession(text);
+  }, CHUNK_MS);
+}
+
+function stopChunking() {
+  if (chunkInterval) { clearInterval(chunkInterval); chunkInterval = null; }
 }
 
 function renderHistory() {
