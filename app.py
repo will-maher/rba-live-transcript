@@ -1,6 +1,9 @@
 import hashlib
 import json
+import logging
 import os
+
+logger = logging.getLogger("verbatim")
 
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -92,12 +95,14 @@ async def stream_ws(websocket: WebSocket, token: str = ""):
     async def on_transcript(self, result, **kwargs):
         try:
             text = result.channel.alternatives[0].transcript
+            logger.info("DG transcript (final=%s): %r", result.is_final, text)
             if text and result.is_final:
                 await websocket.send_json({"type": "transcript", "text": text})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("on_transcript error: %s", e)
 
     async def on_error(self, error, **kwargs):
+        logger.error("DG error: %s", error)
         try:
             await websocket.send_json({"type": "error", "text": str(error)})
         except Exception:
@@ -123,11 +128,16 @@ async def stream_ws(websocket: WebSocket, token: str = ""):
         await websocket.send_json({"type": "error", "text": "Failed to connect to Deepgram — check API key"})
         await websocket.close()
         return
+    logger.info("Deepgram started OK")
     await websocket.send_json({"type": "status", "text": "Live — transcribing", "live": True})
 
+    chunk_count = 0
     try:
         while True:
             data = await websocket.receive_bytes()
+            chunk_count += 1
+            if chunk_count <= 3 or chunk_count % 50 == 0:
+                logger.info("Audio chunk #%d: %d bytes", chunk_count, len(data))
             await dg.send(data)
     except WebSocketDisconnect:
         pass
