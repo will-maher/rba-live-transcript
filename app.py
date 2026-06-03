@@ -275,7 +275,7 @@ HTML = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="Verbatim">
   <link rel="manifest" href="/manifest.json">
   <link rel="apple-touch-icon" href="/icon-180.png">
@@ -295,10 +295,18 @@ HTML = """<!DOCTYPE html>
       --green:   #27AE60;
       --r:       6px;
       --sb:      env(safe-area-inset-bottom, 0px);
+      --st:      env(safe-area-inset-top, 0px);
     }
 
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-    html, body { height: 100%; overscroll-behavior: none; }
+    html, body {
+      height: 100%;
+      width: 100%;
+      max-width: 100%;
+      overflow-x: hidden;            /* no sideways scroll */
+      overscroll-behavior: none;     /* no rubber-band */
+      position: relative;
+    }
     body {
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
       background: var(--bg);
@@ -306,6 +314,7 @@ HTML = """<!DOCTYPE html>
       font-size: 15px;
       line-height: 1.5;
       -webkit-font-smoothing: antialiased;
+      touch-action: pan-y;           /* allow only vertical gestures */
     }
 
     /* ─── LOGIN ─────────────────────────────────── */
@@ -346,23 +355,29 @@ HTML = """<!DOCTYPE html>
     .shake { animation: shake 0.38s ease; }
 
     /* ─── APP SHELL ──────────────────────────────── */
-    #app { display: none; flex-direction: column; height: 100dvh; }
+    #app { display: none; flex-direction: column; height: 100dvh; width: 100%; max-width: 100%; overflow-x: hidden; }
     header {
       display: flex; align-items: flex-end; justify-content: space-between;
-      padding: 18px 24px 0; border-bottom: 1px solid var(--border);
+      padding: calc(14px + var(--st)) 20px 0; border-bottom: 1px solid var(--border);
       background: var(--bg); position: sticky; top: 0; z-index: 20; flex-shrink: 0;
     }
-    .wordmark { font-size: 11px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; padding-bottom: 14px; }
+    .wordmark { font-size: 11px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; padding-bottom: 16px; }
     nav { display: flex; }
     .tab {
-      padding: 14px 0; margin-left: 28px; font-size: 13px; font-weight: 400;
+      padding: 16px 9px; margin-left: 6px; font-size: 13px; font-weight: 400;
       color: var(--muted); cursor: pointer; border-bottom: 1.5px solid transparent;
       transition: color 0.15s, border-color 0.15s; user-select: none;
+      -webkit-user-select: none;
     }
     .tab.active { color: var(--text); border-bottom-color: var(--text); }
     .tab-lock { color: var(--muted); }
     .tab-lock:active { opacity: 0.6; }
-    .scroll-area { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .scroll-area {
+      flex: 1; overflow-y: auto; overflow-x: hidden;
+      -webkit-overflow-scrolling: touch;
+      touch-action: pan-y; overscroll-behavior: contain;
+      width: 100%; max-width: 100%;
+    }
 
     /* ─── NEW SESSION ────────────────────────────── */
     #view-new { padding: 32px 24px; display: flex; flex-direction: column; gap: 22px; }
