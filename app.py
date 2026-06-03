@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import time
+from contextlib import asynccontextmanager
 
+import asyncpg
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -9,15 +12,60 @@ from pydantic import BaseModel
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "verbatim")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # Deterministic token derived from password — survives redeploys
 VALID_TOKEN = hashlib.sha256(f"verbatim:{APP_PASSWORD}".encode()).hexdigest()
 
-app = FastAPI()
+# Connection pool — None until startup connects, stays None if no DATABASE_URL
+db_pool = None
+
+
+@asynccontextmanager
+async def lifespan(app):
+    global db_pool
+    if DATABASE_URL:
+        try:
+            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS transcripts (
+                        id         TEXT PRIMARY KEY,
+                        title      TEXT NOT NULL,
+                        content    TEXT NOT NULL,
+                        words      INTEGER NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+            print("DB connected and table ready", flush=True)
+        except Exception as e:
+            print(f"DB init failed ({e}) — history will fall back to localStorage", flush=True)
+            db_pool = None
+    else:
+        print("No DATABASE_URL set — history will use per-device localStorage", flush=True)
+    yield
+    if db_pool:
+        await db_pool.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class LoginRequest(BaseModel):
     password: str
+
+
+class TranscriptIn(BaseModel):
+    title: str
+    content: str
+    words: int
+
+
+def require_token(token: str):
+    if token != VALID_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @app.post("/login")
@@ -25,6 +73,56 @@ async def login(req: LoginRequest):
     if req.password != APP_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid password")
     return {"token": VALID_TOKEN}
+
+
+@app.get("/history")
+async def get_history(token: str = ""):
+    require_token(token)
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="History sync not configured")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, title, content, words, created_at "
+            "FROM transcripts ORDER BY created_at DESC LIMIT 200"
+        )
+    return [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "content": r["content"],
+            "words": r["words"],
+            "createdAt": r["created_at"].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/history")
+async def add_history(item: TranscriptIn, token: str = ""):
+    require_token(token)
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="History sync not configured")
+    new_id = str(int(time.time() * 1000))
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO transcripts (id, title, content, words) "
+            "VALUES ($1, $2, $3, $4) RETURNING id, created_at",
+            new_id,
+            item.title,
+            item.content,
+            item.words,
+        )
+    return {"id": row["id"], "createdAt": row["created_at"].isoformat()}
+
+
+@app.delete("/history/{tid}")
+async def delete_history(tid: str, token: str = ""):
+    require_token(token)
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="History sync not configured")
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM transcripts WHERE id = $1", tid)
+    return {"ok": True}
 
 
 @app.get("/manifest.json")
@@ -256,6 +354,8 @@ HTML = """<!DOCTYPE html>
       transition: color 0.15s, border-color 0.15s; user-select: none;
     }
     .tab.active { color: var(--text); border-bottom-color: var(--text); }
+    .tab-lock { color: var(--muted); }
+    .tab-lock:active { opacity: 0.6; }
     .scroll-area { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 
     /* ─── NEW SESSION ────────────────────────────── */
@@ -369,6 +469,7 @@ HTML = """<!DOCTYPE html>
     <nav>
       <div class="tab active" id="tab-new" onclick="nav('new')">New</div>
       <div class="tab" id="tab-history" onclick="nav('history')">History</div>
+      <div class="tab tab-lock" onclick="logout()">Lock</div>
     </nav>
   </header>
 
@@ -447,6 +548,24 @@ const HISTORY_KEY = 'vb_history';
 let ws = null, audioCtx = null, mediaStream = null;
 let buffer = '', activeId = null, toastTimer;
 let timerInterval = null, currentSrc = 'tab';
+let historyCache = [];
+
+/* Authed fetch helper — appends token query param */
+function api(path, opts) {
+  const token = localStorage.getItem(TOKEN_KEY) || '';
+  const sep = path.includes('?') ? '&' : '?';
+  return fetch(path + sep + 'token=' + encodeURIComponent(token), opts || {});
+}
+
+function logout() {
+  if (ws || mediaStream) endSession();
+  localStorage.removeItem(TOKEN_KEY);
+  historyCache = [];
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login-view').style.display = 'flex';
+  document.getElementById('loginPass').value = '';
+  document.getElementById('loginErr').textContent = '';
+}
 
 /* ── Auth ──────────────────────────────────────── */
 async function doLogin() {
@@ -495,7 +614,7 @@ function nav(name) {
   document.getElementById('view-' + name).style.display = 'block';
   const t = document.getElementById('tab-' + name);
   if (t) t.classList.add('active');
-  if (name === 'history') renderHistory();
+  if (name === 'history') loadHistory();
 }
 
 /* ── Source toggle ─────────────────────────────── */
@@ -648,21 +767,50 @@ function copyText() {
   navigator.clipboard.writeText(buffer.trim()).then(() => toast('Copied'));
 }
 
-/* ── Storage ───────────────────────────────────── */
-function getHistory() {
+/* ── Storage ───────────────────────────────────────
+   Primary: server (Postgres) so history syncs across
+   devices. Falls back to per-device localStorage when
+   the server has no database configured / is offline. */
+function getLocalHistory() {
   try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return []; }
 }
 
-function persist(text) {
-  const h = getHistory();
-  const words = text.split(/[\s]+/);
+async function loadHistory() {
+  renderHistory(); // paint current cache instantly
+  try {
+    const r = await api('/history');
+    if (!r.ok) throw new Error('server ' + r.status);
+    historyCache = await r.json();
+  } catch {
+    historyCache = getLocalHistory();
+  }
+  renderHistory();
+}
+
+async function persist(text) {
+  const words = text.split(/\\s+/).filter(Boolean);
   const preview = words.slice(0, 7).join(' ') + (words.length > 7 ? '…' : '');
-  h.unshift({ id: Date.now().toString(), title: preview, content: text, createdAt: new Date().toISOString(), words: words.length });
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 100)));
+  const item = { title: preview, content: text, words: words.length };
+  try {
+    const r = await api('/history', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(item)
+    });
+    if (!r.ok) throw new Error('server ' + r.status);
+    const {id, createdAt} = await r.json();
+    historyCache.unshift({ ...item, id, createdAt });
+  } catch {
+    const local = { ...item, id: Date.now().toString(), createdAt: new Date().toISOString() };
+    const h = getLocalHistory();
+    h.unshift(local);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(h.slice(0, 100)));
+    historyCache.unshift(local);
+  }
 }
 
 function renderHistory() {
-  const h = getHistory();
+  const h = historyCache;
   const el = document.getElementById('historyList');
   if (!h.length) {
     el.innerHTML = '<div class="empty-state">No sessions yet.<br>Start a new transcription to begin.</div>';
@@ -679,7 +827,7 @@ function renderHistory() {
 }
 
 function openDetail(id) {
-  const t = getHistory().find(x => x.id === id);
+  const t = historyCache.find(x => x.id === id);
   if (!t) return;
   activeId = id;
   document.getElementById('detailTitle').textContent = t.title;
@@ -689,13 +837,20 @@ function openDetail(id) {
 }
 
 function copyDetail() {
-  const t = getHistory().find(x => x.id === activeId);
+  const t = historyCache.find(x => x.id === activeId);
   if (t) navigator.clipboard.writeText(t.content).then(() => toast('Copied'));
 }
 
-function deleteDetail() {
-  const h = getHistory().filter(x => x.id !== activeId);
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+async function deleteDetail() {
+  const id = activeId;
+  try {
+    const r = await api('/history/' + encodeURIComponent(id), {method: 'DELETE'});
+    if (!r.ok) throw new Error('server ' + r.status);
+  } catch {
+    const h = getLocalHistory().filter(x => x.id !== id);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+  }
+  historyCache = historyCache.filter(x => x.id !== id);
   nav('history');
   toast('Deleted');
 }
