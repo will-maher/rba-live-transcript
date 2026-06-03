@@ -55,20 +55,27 @@ async def icon():
 
 @app.get("/sw.js")
 async def service_worker():
-    sw = """const CACHE = 'verbatim-v3';
-self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.add('/')));
-  self.skipWaiting();
-});
+    sw = """const CACHE = 'verbatim-v4';
+self.addEventListener('install', e => { self.skipWaiting(); });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(ks =>
-    Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    Promise.all(ks.map(k => caches.delete(k)))
   ));
   self.clients.claim();
 });
+// Network-first: always fetch fresh so app updates land immediately.
+// Fall back to cache only when offline.
 self.addEventListener('fetch', e => {
   if (e.request.url.includes('/stream') || e.request.url.includes('/login')) return;
-  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+  e.respondWith(
+    fetch(e.request)
+      .then(r => {
+        const copy = r.clone();
+        caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {});
+        return r;
+      })
+      .catch(() => caches.match(e.request))
+  );
 });"""
     return Response(sw, media_type="application/javascript")
 
