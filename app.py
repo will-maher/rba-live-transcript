@@ -133,22 +133,27 @@ async def manifest():
         "description": "Live transcription",
         "start_url": "/",
         "display": "standalone",
-        "background_color": "#F4F3EE",
+        "background_color": "#1A1917",
         "theme_color": "#1A1917",
         "icons": [
-            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ]
     })
 
 
-@app.get("/icon.svg")
-async def icon():
-    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" fill="#1A1917"/>
-  <text x="256" y="340" font-family="-apple-system,sans-serif" font-size="260"
-        font-weight="300" fill="#F4F3EE" text-anchor="middle">V</text>
-</svg>"""
-    return Response(svg, media_type="image/svg+xml")
+_ICON_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.get("/icon-{name}.png")
+async def icon_png(name: str):
+    path = os.path.join(_ICON_DIR, f"icon-{name}.png")
+    if name not in {"180", "192", "512"} or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Not found")
+    with open(path, "rb") as f:
+        data = f.read()
+    return Response(data, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/sw.js")
@@ -273,7 +278,8 @@ HTML = """<!DOCTYPE html>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Verbatim">
   <link rel="manifest" href="/manifest.json">
-  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="apple-touch-icon" href="/icon-180.png">
+  <link rel="icon" type="image/png" href="/icon-192.png">
   <title>Verbatim</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -478,7 +484,7 @@ HTML = """<!DOCTYPE html>
     <!-- New -->
     <div id="view-new">
 
-      <div>
+      <div id="source-block">
         <div class="label">Audio source</div>
         <div class="source-toggle">
           <button class="source-opt active" id="src-tab" onclick="setSrc('tab')">Tab / Screen</button>
@@ -491,6 +497,9 @@ HTML = """<!DOCTYPE html>
       </div>
       <div id="hint-mic" class="hint" style="display:none">
         <strong>Microphone mode:</strong> your device mic will be used. On a phone, hold it near the speaker playing the audio.
+      </div>
+      <div id="hint-mobile" class="hint" style="display:none">
+        <strong>On this device</strong> only microphone capture is available — hold your phone near the speaker playing the audio. Tab/screen capture works on a desktop browser.
       </div>
 
       <div>
@@ -598,6 +607,7 @@ document.getElementById('loginPass').addEventListener('keydown', e => {
 function boot() {
   document.getElementById('login-view').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
+  detectCapabilities();
   nav('new');
 }
 
@@ -616,12 +626,29 @@ function nav(name) {
 }
 
 /* ── Source toggle ─────────────────────────────── */
+const TAB_CAPTURE_SUPPORTED =
+  !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+
 function setSrc(src) {
+  if (!TAB_CAPTURE_SUPPORTED) src = 'mic';
   currentSrc = src;
   document.getElementById('src-tab').classList.toggle('active', src === 'tab');
   document.getElementById('src-mic').classList.toggle('active', src === 'mic');
-  document.getElementById('hint-tab').style.display = src === 'tab' ? 'block' : 'none';
-  document.getElementById('hint-mic').style.display = src === 'mic' ? 'block' : 'none';
+  document.getElementById('hint-tab').style.display =
+    (TAB_CAPTURE_SUPPORTED && src === 'tab') ? 'block' : 'none';
+  document.getElementById('hint-mic').style.display =
+    (TAB_CAPTURE_SUPPORTED && src === 'mic') ? 'block' : 'none';
+}
+
+/* On devices without tab/screen capture (phones, tablets), hide the
+   source toggle entirely and run microphone-only. */
+function detectCapabilities() {
+  if (TAB_CAPTURE_SUPPORTED) return;
+  currentSrc = 'mic';
+  document.getElementById('source-block').style.display = 'none';
+  document.getElementById('hint-tab').style.display = 'none';
+  document.getElementById('hint-mic').style.display = 'none';
+  document.getElementById('hint-mobile').style.display = 'block';
 }
 
 /* ── Timer ─────────────────────────────────────── */
