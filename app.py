@@ -1,9 +1,6 @@
 import hashlib
 import json
-import logging
 import os
-
-logger = logging.getLogger("verbatim")
 
 from deepgram import DeepgramClient, LiveOptions, LiveTranscriptionEvents
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -95,14 +92,14 @@ async def stream_ws(websocket: WebSocket, token: str = ""):
     async def on_transcript(self, result, **kwargs):
         try:
             text = result.channel.alternatives[0].transcript
-            logger.info("DG transcript (final=%s): %r", result.is_final, text)
+            print(f"DG transcript (final={result.is_final}): {text!r}", flush=True)
             if text and result.is_final:
                 await websocket.send_json({"type": "transcript", "text": text})
         except Exception as e:
-            logger.warning("on_transcript error: %s", e)
+            print(f"on_transcript error: {e}", flush=True)
 
     async def on_error(self, error, **kwargs):
-        logger.error("DG error: %s", error)
+        print(f"DG error: {error}", flush=True)
         try:
             await websocket.send_json({"type": "error", "text": str(error)})
         except Exception:
@@ -123,12 +120,21 @@ async def stream_ws(websocket: WebSocket, token: str = ""):
         endpointing=500,
     )
 
-    started = await dg.start(options)
+    try:
+        started = await dg.start(options)
+    except BaseException as e:
+        print(f"dg.start() raised: {type(e).__name__}: {e}", flush=True)
+        await websocket.send_json({"type": "error", "text": f"Deepgram start failed: {e}"})
+        await websocket.close()
+        return
+
     if not started:
+        print("dg.start() returned False", flush=True)
         await websocket.send_json({"type": "error", "text": "Failed to connect to Deepgram — check API key"})
         await websocket.close()
         return
-    logger.info("Deepgram started OK")
+
+    print("Deepgram started OK", flush=True)
     await websocket.send_json({"type": "status", "text": "Live — transcribing", "live": True})
 
     chunk_count = 0
@@ -137,7 +143,7 @@ async def stream_ws(websocket: WebSocket, token: str = ""):
             data = await websocket.receive_bytes()
             chunk_count += 1
             if chunk_count <= 3 or chunk_count % 50 == 0:
-                logger.info("Audio chunk #%d: %d bytes", chunk_count, len(data))
+                print(f"Audio chunk #{chunk_count}: {len(data)} bytes", flush=True)
             await dg.send(data)
     except WebSocketDisconnect:
         pass
