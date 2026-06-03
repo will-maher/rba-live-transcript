@@ -573,6 +573,7 @@ let ws = null, audioCtx = null, mediaStream = null;
 let buffer = '', activeId = null, toastTimer;
 let timerInterval = null, currentSrc = 'tab';
 let historyCache = [];
+let sessionActive = false;
 
 /* Authed fetch helper — appends token query param */
 function api(path, opts) {
@@ -727,6 +728,7 @@ async function startSession() {
   }
 
   mediaStream = stream;
+  sessionActive = true;
   buffer = '';
   renderBuffer();
   document.getElementById('stopBtn').style.display = 'block';
@@ -773,6 +775,8 @@ async function startSession() {
 function stopSession() { endSession(); }
 
 function endSession() {
+  if (!sessionActive) return;   // guard against double-fire (Stop + ws.onclose + track 'ended')
+  sessionActive = false;
   if (ws) { ws.close(); ws = null; }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
