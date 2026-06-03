@@ -379,7 +379,7 @@ HTML = """<!DOCTYPE html>
       </div>
 
       <div id="hint-tab" class="hint">
-        <strong>How it works:</strong> click Start, then pick the browser tab or window playing the audio. Works with YouTube, the RBA site, or anything else.
+        <strong>How it works:</strong> click Start, then pick the browser tab playing the audio. <strong>Important:</strong> in Chrome's share dialog, make sure "Share tab audio" (or "Share audio") is ticked — it's off by default.
       </div>
       <div id="hint-mic" class="hint" style="display:none">
         <strong>Microphone mode:</strong> your device mic will be used. On a phone, hold it near the speaker playing the audio.
@@ -665,7 +665,7 @@ function renderHistory() {
     <div class="list-item" onclick="openDetail('${t.id}')">
       <div class="item-body">
         <div class="item-title">${esc(t.title)}</div>
-        <div class="item-meta">${fmtDate(t.createdAt)}&nbsp;&middot;&nbsp;${t.words.toLocaleString()} words</div>
+        <div class="item-meta">${fmtDate(t.createdAt)}${t.words != null ? '&nbsp;&middot;&nbsp;' + t.words.toLocaleString() + ' words' : ''}</div>
       </div>
       <div class="item-chevron">&#8250;</div>
     </div>`).join('') + '</div>';
@@ -676,7 +676,7 @@ function openDetail(id) {
   if (!t) return;
   activeId = id;
   document.getElementById('detailTitle').textContent = t.title;
-  document.getElementById('detailMeta').textContent = fmtDate(t.createdAt) + ' · ' + t.words.toLocaleString() + ' words';
+  document.getElementById('detailMeta').textContent = fmtDate(t.createdAt) + (t.words != null ? ' · ' + t.words.toLocaleString() + ' words' : '');
   document.getElementById('detailBody').textContent = t.content;
   nav('detail');
 }
